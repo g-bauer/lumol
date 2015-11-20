@@ -72,9 +72,13 @@ mod ewald {
             MolecularDynamics::new(units::from(1.0, "fs").unwrap())
         );
 
+        simulation.add_output(EnergyOutput::new("energy.dat").unwrap());
+
         let e_initial = system.total_energy();
         simulation.run(&mut system, 100);
         let e_final = system.total_energy();
-        assert!(f64::abs((e_initial - e_final)/e_final) < 1e-4);
+
+        println!("{:?}", f64::abs((e_initial - e_final)/e_final));
+        assert!(f64::abs((e_initial - e_final)/e_final) < 1e-6);
     }
 }

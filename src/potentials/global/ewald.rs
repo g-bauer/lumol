@@ -39,10 +39,18 @@ pub struct Ewald {
     kmax2: Cell<f64>,
     /// Restriction scheme
     restriction: PairRestriction,
-    /// Caching exponential factors exp(-k^2 / (4 alpha^2)) / k^2
+    /// Caching exponential factors `exp(-k^2 / (4 alpha^2)) / k^2`.
+    ///
+    /// k vectors are indexed by three isize number, in the intervals
+    /// `[0, kmax] x [-kmax, kmax] x [-kmax, kmax]`. Because we do not have
+    /// negative integers indexing, we use `[0, kmax] x [0, 2kmax+1] x [0, 2kmax+1]`,
+    /// and translate all the indexes.
     expfactors: RefCell<Array3<f64>>,
-    /// Phases for the Fourier transform
-    fourier_phases: RefCell<Array3<f64>>,
+    /// Phases for the Fourier transform.
+    ///
+    /// This is indexed by `[0, 2*kmax+1] x [0, natoms - 1] x [0, 2]`, with the
+    /// same translation in the first index that for `expfactors`.
+    fourier_factors: RefCell<Array3<Complex>>,
     /// Fourier transform of the electrostatic density
     rho: RefCell<Array3<Complex>>,
     /// Guard for cache invalidation of expfactors
@@ -53,79 +61,21 @@ impl Ewald {
     /// Create an Ewald summation using the `rc` cutoff radius in real space,
     /// and `kmax` points in k-space (Fourier space).
     pub fn new(rc: f64, kmax: usize) -> Ewald {
-        let kmax = kmax + 1;
-        let expfactors = Array3::zeros((kmax, kmax, kmax));
-        let rho = Array3::zeros((kmax, kmax, kmax));
+        let ksize = 2 * kmax + 1;
+        let expfactors = Array3::zeros((kmax + 1, ksize, ksize));
+        let rho = Array3::zeros((kmax + 1, ksize, ksize));
+        let alpha = 3.0 * PI / (4.0 * rc);
         Ewald {
-            alpha: 3.0 * PI / (rc * 4.0),
+            alpha: alpha,
             rc: rc,
             kmax: kmax,
             kmax2: Cell::new(0.0),
             restriction: PairRestriction::None,
             expfactors: RefCell::new(expfactors),
-            fourier_phases: RefCell::new(Array3::zeros((0, 0, 0))),
+            fourier_factors: RefCell::new(Array3::zeros((0, 0, 0))),
             rho: RefCell::new(rho),
             previous_cell: Cell::new(None),
         }
-    }
-
-    fn precompute(&self, cell: &UnitCell) {
-        if let Some(ref prev_cell) = self.previous_cell.get() {
-            if cell == prev_cell {
-                // Do not recompute
-                return;
-            }
-        }
-        match cell.celltype() {
-            CellType::Infinite => {
-                error!("Can not use Ewald sum with Infinite cell.");
-                panic!();
-            },
-            CellType::Triclinic => {
-                error!("Can not (yet) use Ewald sum with Triclinic cell.");
-                unimplemented!();
-            },
-            CellType::Orthorombic => {
-                // All good!
-            },
-        }
-        self.previous_cell.set(Some(cell.clone()));
-        let mut expfactors = self.expfactors.borrow_mut();
-
-        // Because we do a spherical truncation in k space, we have to transform
-        // kmax into a spherical cutoff 'radius'
-        let lenghts = cell.lengths();
-        let max_lenght = f64::max(f64::max(lenghts.0, lenghts.1), lenghts.2);
-        let min_lenght = f64::min(f64::min(lenghts.0, lenghts.1), lenghts.2);
-        let k_rc = self.kmax as f64 * (2.0 * PI / max_lenght);
-        self.kmax2.set(k_rc * k_rc);
-
-        if self.rc > min_lenght / 2.0 {
-            warn!("The Ewald cutoff is too high for this unit cell, energy might be wrong.");
-        }
-
-        // Now, we precompute the exp(-k^2/4a^2)/k^2 terms. We use the symmetry to
-        // only store (ikx >= 0 && iky >= 0  && ikz >= 0 ) terms
-        let (rec_vx, rec_vy, rec_vz) = cell.reciprocal_vectors();
-        for ikx in 0..self.kmax {
-            let kx = (ikx as f64) * rec_vx;
-            for iky in 0..self.kmax {
-                let ky = kx + (iky as f64) * rec_vy;
-                for ikz in 0..self.kmax {
-                    let k = ky + (ikz as f64) * rec_vz;
-                    let k2 = k.norm2();
-                    if k2 > self.kmax2.get() {
-                        expfactors[(ikx, iky, ikz)] = 0.0;
-                        continue;
-                    }
-                    expfactors[(ikx, iky, ikz)] = f64::exp(-k2 / (4.0 * self.alpha * self.alpha)) / k2;
-                    if ikx != 0 {expfactors[(ikx, iky, ikz)] *= 2.0;}
-                    if iky != 0 {expfactors[(ikx, iky, ikz)] *= 2.0;}
-                    if ikz != 0 {expfactors[(ikx, iky, ikz)] *= 2.0;}
-                }
-            }
-        }
-        expfactors[(0, 0, 0)] = 0.0;
     }
 }
 
@@ -220,38 +170,114 @@ impl Ewald {
 
 /// k-space part of the summation
 impl Ewald {
-    /// Compute the Fourier transform of the electrostatic density
-    fn density_fft(&self, system: &System) {
-        let natoms = system.size();
-        let mut fourier_phases = self.fourier_phases.borrow_mut();
-        fourier_phases.resize_if_different((self.kmax, natoms, 3));
+    /// Get the index in any array indexed by k point from the 3 k indexes. This
+    /// function assumes that the indexes are in the [-kmax, kmax] range.
+    #[inline]
+    fn get_idx(&self, kx: isize, ky: isize, kz: isize) -> (usize, usize, usize) {
+        let ky = (ky + self.kmax as isize) as usize;
+        let kz = (kz + self.kmax as isize) as usize;
+        return (kx as usize, ky, kz)
+    }
 
-        // Do the k=0, 1 cases first
-        for i in 0..natoms {
-            let ri = system.cell().fractional(&system[i].position);
-            for j in 0..3 {
-                fourier_phases[(0, i, j)] = 0.0;
-                fourier_phases[(1, i, j)] = -2.0 * PI * ri[j];
+    /// Translate a k index from [-kmax, kmax] to [0, 2kmax + 1].
+    #[inline]
+    fn trans_idx(&self, k: isize) -> usize {
+        (k + self.kmax as isize) as usize
+    }
+
+    fn precompute(&self, cell: &UnitCell) {
+        if let Some(ref prev_cell) = self.previous_cell.get() {
+            if cell == prev_cell {
+                // Do not recompute
+                return;
             }
         }
 
+         match cell.celltype() {
+            CellType::Infinite => {
+                error!("Can not use Ewald sum with Infinite cell.");
+                panic!();
+            },
+            CellType::Triclinic | CellType::Orthorombic => {
+                // All good!
+            },
+        }
+
+        self.previous_cell.set(Some(*cell));
+        let mut expfactors = self.expfactors.borrow_mut();
+
+        // Because we do a spherical truncation in k space, we have to transform
+        // kmax into a spherical cutoff 'radius'
+        let lenghts = cell.lengths();
+        let max_lenght = f64::max(f64::max(lenghts.0, lenghts.1), lenghts.2);
+        let min_lenght = f64::min(f64::min(lenghts.0, lenghts.1), lenghts.2);
+        let k_rc = self.kmax as f64 * (2.0 * PI / max_lenght);
+        self.kmax2.set(k_rc * k_rc);
+
+        if self.rc > min_lenght / 2.0 {
+            warn!("The Ewald cutoff is too high for this unit cell, energy might be wrong.");
+        }
+
+        // Now, we precompute the exp(-k^2/4a^2)/k^2 terms. We use the symmetry
+        // to only store ikx >= 0 terms
+        let ikmax = self.kmax as isize;
+        let (rec_vx, rec_vy, rec_vz) = cell.reciprocal_vectors();
+        for ikx in 0..(ikmax + 1) {
+            for iky in (-ikmax)..(ikmax + 1) {
+                for ikz in (-ikmax)..(ikmax + 1) {
+                    let k = (ikx as f64) * rec_vx + (iky as f64) * rec_vy + (ikz as f64) * rec_vz;
+                    let k2 = k.norm2();
+                    let idx = self.get_idx(ikx, iky, ikz);
+                    if k2 > self.kmax2.get() {
+                        expfactors[idx] = 0.0;
+                        continue;
+                    }
+                    expfactors[idx] = f64::exp(-k2 / (4.0 * self.alpha * self.alpha)) / k2;
+                    if ikx != 0 {expfactors[idx] *= 2.0;}
+                }
+            }
+        }
+        let idx = self.get_idx(0, 0, 0);
+        expfactors[idx] = 0.0;
+    }
+
+    /// Compute the Fourier transform of the electrostatic density
+    fn density_fft(&self, system: &System) {
+        let mut fourier_factors = self.fourier_factors.borrow_mut();
+
+        let ksize = 2 * self.kmax + 1;
+        let natoms = system.size();
+        fourier_factors.resize_if_different((ksize, natoms, 3));
+
+        // Do the k=(-1, 0, 1) cases first
+        for i in 0..natoms {
+            let ri = system.cell().fractional(&system[i].position);
+            for j in 0..3 {
+                fourier_factors[(self.trans_idx(0), i, j)] = Complex::cartesian(1.0, 0.0);
+                fourier_factors[(self.trans_idx(1), i, j)] = Complex::polar(1.0, -2.0 * PI * ri[j]);
+                fourier_factors[(self.trans_idx(-1), i, j)] = fourier_factors[(self.trans_idx(1), i, j)].conj();
+            }
+        }
+
+        let ikmax = self.kmax as isize;
         // Use recursive definition for computing the factor for all the other values of k.
-        for k in 2..self.kmax {
+        for ik in 2..(ikmax + 1) {
             for i in 0..natoms {
                 for j in 0..3 {
-                    fourier_phases[(k, i, j)] = fourier_phases[(k - 1, i, j)] + fourier_phases[(1, i, j)];
+                    fourier_factors[(self.trans_idx(ik), i, j)] = fourier_factors[(self.trans_idx(ik - 1), i, j)] * fourier_factors[(self.trans_idx(1), i, j)];
+                    fourier_factors[(self.trans_idx(-ik), i, j)] = fourier_factors[(self.trans_idx(ik), i, j)].conj();
                 }
             }
         }
 
         let mut rho = self.rho.borrow_mut();
-        for ikx in 0..self.kmax {
-            for iky in 0..self.kmax {
-                for ikz in 0..self.kmax {
-                    rho[(ikx, iky, ikz)] = Complex::polar(0.0, 0.0);
-                    for j in 0..natoms {
-                        let phi = fourier_phases[(ikx, j, 0)] + fourier_phases[(iky, j, 1)] + fourier_phases[(ikz, j, 2)];
-                        rho[(ikx, iky, ikz)] = rho[(ikx, iky, ikz)] + Complex::polar(system[j].charge, phi);
+        for kx in 0..(self.kmax + 1) {
+            for ky in 0..(2*self.kmax + 1) {
+                for kz in 0..(2*self.kmax + 1) {
+                    rho[(kx, ky, kz)] = Complex::cartesian(0.0, 0.0);
+                    for i in 0..natoms {
+                        let rho_i = system[i].charge * fourier_factors[(kx, i, 0)] * fourier_factors[(ky, i, 1)] * fourier_factors[(kz, i, 2)];
+                        rho[(kx, ky, kz)] = rho[(kx, ky, kz)] + rho_i;
                     }
                 }
             }
@@ -265,14 +291,14 @@ impl Ewald {
 
         let expfactors = self.expfactors.borrow();
         let rho = self.rho.borrow();
-        for ikx in 0..self.kmax {
-            for iky in 0..self.kmax {
-                for ikz in 0..self.kmax {
+        for kx in 0..(self.kmax + 1) {
+            for ky in 0..(2*self.kmax + 1) {
+                for kz in 0..(2*self.kmax + 1) {
                     // The k = 0 case and the cutoff in k-space are already
                     // handled in expfactors
-                    if expfactors[(ikx, iky, ikz)].abs() < f64::MIN {continue}
-                    let density = rho[(ikx, iky, ikz)].norm();
-                    energy += expfactors[(ikx, iky, ikz)] * density * density;
+                    if expfactors[(kx, ky, kz)].abs() < f64::MIN {continue}
+                    let rho2 = (rho[(kx, ky, kz)] * rho[(kx, ky, kz)].conj()).real();
+                    energy += expfactors[(kx, ky, kz)] * rho2;
                 }
             }
         }
@@ -286,24 +312,26 @@ impl Ewald {
         self.density_fft(system);
 
         let factor = 4.0 * PI / (system.cell().volume() * ELCC);
-        let (rec_kx, rec_ky, rec_kz) = system.cell().reciprocal_vectors();
+        let (rec_vx, rec_vy, rec_vz) = system.cell().reciprocal_vectors();
 
         let expfactors = self.expfactors.borrow();
-        for ikx in 0..self.kmax {
-            for iky in 0..self.kmax {
-                for ikz in 0..self.kmax {
+        let ikmax = self.kmax as isize;
+        for ikx in 0..(ikmax + 1) {
+            for iky in (-ikmax)..(ikmax + 1) {
+                for ikz in (-ikmax)..(ikmax + 1) {
                     // The k = 0 and the cutoff in k-space are already handled in
                     // expfactors.
-                    if expfactors[(ikx, iky, ikz)].abs() < f64::MIN {continue}
-                    let k = (ikx as f64) * rec_kx + (iky as f64) * rec_ky + (ikz as f64) * rec_kz;
+                    let idx = self.get_idx(ikx, iky, ikz);
+                    if expfactors[idx].abs() < f64::MIN {continue}
+                    let k = (ikx as f64) * rec_vx + (iky as f64) * rec_vy + (ikz as f64) * rec_vz;
                     for i in 0..system.size() {
                         let qi = system[i].charge;
                         for j in (i + 1)..system.size() {
                             let qj = system[j].charge;
-                            let force = factor * self.kspace_force_factor(i, j, ikx, iky, ikz, qi, qj) * k;
+                            let force = factor * self.kspace_force_factor(i, j, idx.0, idx.1, idx.2, qi, qj) * k;
 
-                            res[i] = res[i] - force;
-                            res[j] = res[j] + force;
+                            res[i] = res[i] + force;
+                            res[j] = res[j] - force;
                         }
                     }
                 }
@@ -312,17 +340,18 @@ impl Ewald {
     }
 
     /// Get the force factor for particles `i` and `j` with charges `qi` and
-    /// `qj`, at k point  `(ikx, iky, ikz)`
-    #[inline]
-    fn kspace_force_factor(&self, i: usize, j: usize, ikx: usize, iky: usize, ikz: usize, qi: f64, qj: f64) -> f64 {
-        let fourier_phases = self.fourier_phases.borrow();
+    /// `qj`, at k point  `(kx, ky, kz)`. `(kx, ky, kz)` must be the indexes
+    /// of the arrays, already translated.
+    #[inline(always)]
+    fn kspace_force_factor(&self, i: usize, j: usize, kx: usize, ky: usize, kz: usize, qi: f64, qj: f64) -> f64 {
+        let fourier_factors = self.fourier_factors.borrow();
         let expfactors = self.expfactors.borrow();
 
-        let fourier_i = fourier_phases[(ikx, i, 0)] + fourier_phases[(iky, i, 1)] + fourier_phases[(ikz, i, 2)];
-        let fourier_j = fourier_phases[(ikx, j, 0)] + fourier_phases[(iky, j, 1)] + fourier_phases[(ikz, j, 2)];
-        let sin_kr = fast_sin(fourier_i - fourier_j);
+        let fourier_i = fourier_factors[(kx, i, 0)] * fourier_factors[(ky, i, 1)] * fourier_factors[(kz, i, 2)];
+        let fourier_j = fourier_factors[(kx, j, 0)] * fourier_factors[(ky, j, 1)] * fourier_factors[(kz, j, 2)];
+        let sin_kr = (fourier_i * fourier_j.conj()).imag();
 
-        return qi * qj * expfactors[(ikx, iky, ikz)] * sin_kr;
+        return qi * qj * expfactors[(kx, ky, kz)] * sin_kr;
     }
 
     /// k-space contribution to the virial
@@ -331,21 +360,23 @@ impl Ewald {
         let mut res = Matrix3::zero();
 
         let factor = 4.0 * PI / (system.cell().volume() * ELCC);
-        let (rec_kx, rec_ky, rec_kz) = system.cell().reciprocal_vectors();
+        let (rec_vx, rec_vy, rec_vz) = system.cell().reciprocal_vectors();
 
         let expfactors = self.expfactors.borrow();
-        for ikx in 0..self.kmax {
-            for iky in 0..self.kmax {
-                for ikz in 0..self.kmax {
+        let ikmax = self.kmax as isize;
+        for ikx in 0..(ikmax + 1) {
+            for iky in (-ikmax)..(ikmax + 1) {
+                for ikz in (-ikmax)..(ikmax + 1) {
                     // The k = 0 and the cutoff in k-space are already handled in
                     // expfactors.
-                    if expfactors[(ikx, iky, ikz)].abs() < f64::MIN {continue}
-                    let k = (ikx as f64) * rec_kx + (iky as f64) * rec_ky + (ikz as f64) * rec_kz;
+                    let idx = self.get_idx(ikx, iky, ikz);
+                    if expfactors[idx].abs() < f64::MIN {continue}
+                    let k = (ikx as f64) * rec_vx + (iky as f64) * rec_vy + (ikz as f64) * rec_vz;
                     for i in 0..system.size() {
                         let qi = system[i].charge;
                         for j in (i + 1)..system.size() {
                             let qj = system[j].charge;
-                            let force = factor * self.kspace_force_factor(i, j, ikx, iky, ikz, qi, qj) * k;
+                            let force = factor * self.kspace_force_factor(i, j, idx.0, idx.1, idx.2, qi, qj) * k;
                             let rij = system.wraped_vector(i, j);
 
                             res = res + force.tensorial(&rij);
@@ -356,27 +387,6 @@ impl Ewald {
         }
         return res;
     }
-}
-
-/// This an implementation of the sin function which is faster than the libm
-/// sin function on my i7 processor. I'll have to benchmarck this on other
-/// architectures and OS.
-///
-/// Using this function in `kspace_force_factor` gives me a 40% speedup of the
-/// overall simulation time.
-///
-/// This code comes from http://forum.devmaster.net/t/fast-and-accurate-sine-cosine/9648/85
-fn fast_sin(mut x: f64) -> f64 {
-    const FRAC_1_TWO_PI: f64 = 1.0 / (2.0 * PI);
-    const A: f64 = 7.58946638440411;
-    const B: f64 = 1.6338434577536627;
-
-    x = x * FRAC_1_TWO_PI;
-    x = x - f64::floor(x + 0.5);
-    x = A * x * (0.5 - f64::abs(x));
-    x = x * (B + f64::abs(x));
-
-    return x;
 }
 
 /// Molecular correction for Ewald summation
@@ -544,38 +554,65 @@ mod tests {
     }
 
     #[test]
+    fn indexing() {
+        let ewald = Ewald::new(10.0, 10);
+
+        assert_eq!(ewald.trans_idx(-10), 0);
+        assert_eq!(ewald.trans_idx(0), 10);
+        assert_eq!(ewald.trans_idx(10), 20);
+
+        assert_eq!(ewald.get_idx(0, -5, 4), (0, 5, 14));
+        assert_eq!(ewald.get_idx(0, 3, -4), (0, 13, 6));
+
+        assert_eq!(ewald.get_idx(0, 10, -10), (0, 20, 0));
+    }
+
+    #[test]
     fn energy() {
         let system = testing_system();
-        let ewald = Ewald::new(8.0, 10);
+        let ewald = Ewald::new(10.0, 10);
 
         let e = ewald.energy(&system);
-        assert_approx_eq!(e, E_BRUTE_FORCE, 1e-4);
+        assert_approx_eq!(e, E_BRUTE_FORCE, 1e-5);
     }
 
     #[test]
     fn forces() {
         let mut system = testing_system();
-        let ewald = Ewald::new(8.0, 10);
+        let ewald = Ewald::new(10.0, 10);
 
-        let forces = ewald.forces(&system);
-        let norm = (forces[0] + forces[1]).norm();
-        // Total force should be null
-        assert_approx_eq!(norm, 0.0, 1e-9);
+        // Finite difference by ewald component
+        let real = ewald.real_space_energy(&system);
+        let kspace = ewald.kspace_energy(&system);
 
-        // Finite difference computation of the force
+        const EPS: f64 = 1e-9;
+        system[0].position.x += EPS;
+        let real1 = ewald.real_space_energy(&system);
+        let kspace1 = ewald.kspace_energy(&system);
+
+        let mut forces = vec![Vector3D::new(0.0, 0.0, 0.0); 2];
+        ewald.real_space_forces(&system, &mut forces);
+        let force = forces[0].x;
+        assert_approx_eq!((real - real1)/EPS, force, 1e-6);
+
+        let mut forces = vec![Vector3D::new(0.0, 0.0, 0.0); 2];
+        ewald.kspace_forces(&system, &mut forces);
+        let force = forces[0].x;
+        assert_approx_eq!((kspace - kspace1)/EPS, force, 1e-6);
+
+        // Finite difference computation of the total force
         let e = ewald.energy(&system);
-        let eps = 1e-9;
-        system[0].position[0] += eps;
+        system[0].position[0] += EPS;
 
         let e1 = ewald.energy(&system);
         let force = ewald.forces(&system)[0][0];
-        assert_approx_eq!((e - e1)/eps, force, 1e-6);
+        assert_approx_eq!((e - e1)/EPS, force, 1e-6);
     }
 
     #[test]
     fn virial() {
         let system = testing_system();
-        let ewald = Ewald::new(8.0, 10);
+        let ewald = Ewald::new(10.0, 10);
 
         let virial = ewald.virial(&system);
 
