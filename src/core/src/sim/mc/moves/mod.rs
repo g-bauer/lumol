@@ -83,3 +83,8 @@ pub use self::rotate::Rotate;
 
 mod resize;
 pub use self::resize::Resize;
+
+mod configurational_bias;
+
+// mod rebuild;
+// pub use self::rebuild::Rebuild;
