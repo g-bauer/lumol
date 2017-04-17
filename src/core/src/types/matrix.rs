@@ -91,7 +91,6 @@ impl Matrix3 {
                        [m20, m21, m22]]}
     }
 
-
     /// Returns rotation matrix given a rotation angle and an axis.
     ///
     /// # Examples
@@ -102,14 +101,14 @@ impl Matrix3 {
     /// let e3 = Vector3D::new(0.0f64, 0.0, 1.0);
     /// let angle = 90f64.to_radians();
     ///
-    /// let rotation = Matrix3::rotation_matrix(&(e1*2.0), angle);
+    /// let rotation = Matrix3::rotation(&(e1*2.0), angle);
     /// let mut rot_vec = rotation * e3;
     /// for i in 0..3 {
     ///     rot_vec[i] = (rot_vec[i] * 1.0e8).round() / 1.0e8
     /// };
     /// assert_eq!(rot_vec, Vector3D::new(0.0, 1.0, 0.0));
     /// ```
-    pub fn rotation_matrix(axis: &Vector3D, angle: f64) -> Matrix3 {
+    pub fn rotation(axis: &Vector3D, angle: f64) -> Matrix3 {
         let n = axis.normalized();
         let sin = f64::sin(angle);
         let cos = f64::cos(angle);
@@ -135,6 +134,7 @@ impl Matrix3 {
             (n[2] * n[2]) * one_minus_cos + cos
         )
     }
+
     /// Compute the trace of the matrix
     /// # Examples
     /// ```

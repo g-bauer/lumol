@@ -4,7 +4,7 @@ An input file contains all information that you need to run a simulation.
 It is usually organized in three main sections: **input**, **systems** and
 **simulations**.
 
-- The [input](input/intro.html#Input%20metadata) section contains metadata about
+- The [input](input/intro.html#input-metadata) section contains metadata about
   the input itself (i.e. a version number).
 - The [systems](input/systems.html) section contains information about the
   initial configuration, the interactions between atoms and the simulation cell.
@@ -44,6 +44,10 @@ Introducing a `version` key helps us to make changes to the input file format
 while keeping compatibility with previous formats. Please note that
 Lumol is not in version 1.0 yet and we currently cannot guarantee compatibility
 for input files.
+
+The input files can also contain a `[log]` section to control where should the
+code output be printed. Please see the corresponding
+[documentation](input/log.html) for more information.
 
 ## Units in input
 
