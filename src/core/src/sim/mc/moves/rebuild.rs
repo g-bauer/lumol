@@ -145,12 +145,16 @@ fn segment_noncovalent_intramolecular_energy(
 
 /// Computes the intermolecular energy between a segment and all other atoms in the system
 /// that are not part of the same molecule.
-fn segment_intermolecular_energy(system: &System, segment_position: &Vector3D, segment_id: usize) -> f64 {
+fn segment_intermolecular_energy(
+    system: &System,
+    segment_position: &Vector3D,
+    segment_id: usize
+) -> f64 {
     let mut energy = 0.0;
     let cell = system.cell();
     // maybe rewrite this loop to go over molecules
     for i in 0..self.system.size() {
-        if system.are_in_same_molecule(i, segment_id) { continue };
+        if system.are_in_same_molecule(i, segment_id) { break };
         let r = cell.distance(segment_position, system[i].position);
         for potential in system.pair_potentials(segment_id, i) {
             let info = potential.restriction().information(-1);
