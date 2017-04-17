@@ -164,7 +164,7 @@ pub fn position_from_angle<T: Rng>(
     let e3 = Vector3D::new(0.0, 0.0, 1.0);
     let axis = r10 ^ e3;
     let angle = f64::acos(r10 * e3);
-    let rotation = Matrix3::rotation_matrix(&axis, angle);
+    let rotation = Matrix3::rotation(&axis, angle);
     // Perform rotation and shift position
     rotation * r12 + positions[1]
 }
