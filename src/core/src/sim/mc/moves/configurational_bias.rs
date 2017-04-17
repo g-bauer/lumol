@@ -124,9 +124,23 @@ pub fn create_bond_and_dihedral_angle<T: Rng>(
 }
 
 /// Returns a new position given the previous two positions in a chain molecule.
+///
+/// The resulting position will have a bond angle `theta`
+/// w.r.t to the previous two positions and bond length `length` to the
+/// previous position.
+///
+/// # Construction method (TODO make this more efficient/elegant)
+/// 1. Compute a random vector lying on a cone surface.
+///     * the random angle is uniformly picked from [0, 2PI]
+///     * the cone angle is `theta` with respect to the z-axis
+///     * the length of the vector is `length`
+/// 2. Compute the rotation matrix that rotates the z-axis so that it aligns with
+///    the vector that connects the previous positions.
+/// 3. Rotate vector
+/// 4. Translate vector to align with the rest of the molecule
 pub fn position_from_angle<T: Rng>(
-    positions: &[Vector3D], //&Vec<Vector3D>,
-    l: f64,
+    positions: &[Vector3D],
+    length: f64,
     theta: f64,
     rng: &mut Box<T>
 ) -> Vector3D {
@@ -134,25 +148,25 @@ pub fn position_from_angle<T: Rng>(
     // checks that two positions are handed.
     assert!(positions.len() == 2);
 
-    // Create a random point on a sphere around pole.
-    // The angle between the pole and the point is the desired bond angle.
+    // Create a random point on a cone around pole with distance r.
+    // The cone angle is the desired bond angle.
     let mut range = Range::new(0.0, 2.0 * PI);
     let phi = range.sample(rng);
     let mut r12 = Vector3D::new(
-        f64::sin(theta) * f64::cos(phi),
-        f64::sin(theta) * f64::sin(phi),
-        f64::cos(theta)
+        length * f64::sin(theta) * f64::cos(phi),
+        length * f64::sin(theta) * f64::sin(phi),
+        length * f64::cos(theta)
     );
 
     let r10 = (positions[0] - positions[1]).normalized();
     // Compute the axis about which to rotate so that r10 and the pole
-    // align
+    // align.
     let e3 = Vector3D::new(0.0, 0.0, 1.0);
     let axis = r10 ^ e3;
     let angle = f64::acos(r10 * e3);
     let rotation = Matrix3::rotation_matrix(&axis, angle);
-    // Perform rotation of r12.
-    (rotation * r12).normalized() * l + positions[1]
+    // Perform rotation and shift position
+    rotation * r12 + positions[1]
 }
 
 /// Returns a new position given the previous three positions in a chain molecule.
@@ -228,7 +242,7 @@ mod tests {
     #[test]
     fn test_position_from_angle() {
         let mut rng = Box::new(XorShiftRng::new_unseeded());
-        rng.reseed([2015u32, 42u32, 3u32, 12u32]);
+        rng.reseed([25u32, 42u32, 3u32, 12u32]);
 
         let positions = vec!(
             Vector3D::new(17.0, 1.0, -3.7),
