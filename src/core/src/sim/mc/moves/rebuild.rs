@@ -18,16 +18,16 @@ pub struct Rebuild {
     moltype: Option<u64>,
     /// Index of the molecule to rebuild
     molid: usize,
-    /// Vector that keeps track of which segments are already present in the new molecule
-    is_segment_present: Vec<bool>,
     /// New positions of the rebuilt molecule
-    new_pos: Vec<Vector3D>,
+    newpos: Vec<Vector3D>,
     /// Rosenbluth weight of the new configuration
-    new_weight: Vec<f64>,
+    new_weights: Vec<f64>,
     /// Rosenbluth weight of the old configuration
-    old_weight: Vec<f64>,
+    old_weight: f64,
     /// number of configurational bias steps
-    k: u64,
+    cb_steps: u64,
+    /// early rejection tolerance, hardcode?
+    early_rejection_tolerance: f64,
 }
 
 impl Rebuild {
@@ -50,6 +50,7 @@ impl Rebuild {
             molecule: Vec::new(),
             newpos: Vec::new(),
             k: k,
+            early_rejection_tolerance: 1.0e-200,
         }
     }
 }
@@ -76,35 +77,63 @@ impl MCMove for Rebuild {
             return false;
         }
 
-        let ids: Vec<usize> = system.molecule(self.molid).iter().collect();
+        // clear
+        self.newpos.clear();
+        self.new_weights.clear();
+        self.old_weight = 0.0;
 
-        // rebuild the molecule starting from the 2nd (index 1) segment
-        for segment_id, id in ids.enumerate() {
-            // generate trial segments for the new configuration
-            let mut boltzmann_weight: Vec<f64> = Vec::new();
-            for i in 0..self.k {
-                // if only bond -> create from bond
-                // if bond + angle -> create from angle with bond length from bond
-                // if dihedreal -> whole procedure
-                let external_energy = system.particle_energy(selected_segment);
-                boltmann_weight.push()
-            }
-        }
-        // generate all trial positions:
+        let mut trial_weights: Vec<f64> = Vec::with_capacity(self.cb_steps);
+        let mut trialpos: Vec<Vector3D> = Vec::with_capacity(self.cb_steps);
 
-        // pick first bead and select a position
-        // grow next bead
-        // 1. pick position on sphere
-        // 2. pick length
-        // 3. compute contributions due to bond length, angle and torsion
+        let beta = 1.0 / (K_BOLTZMANN * system.temperature());
 
-        return true;
+        // loop over each atom (segment) of the molecule
+        // .iter() returns the index of the atom to use to index into system
+        // pid == particle index
+        for pid in system.molecule(self.molid).iter() {
+            trial_weights.clear();
+            trialpos.clear();
+
+            // loop over trials
+            // this is how you'd find it in literature
+            // maybe it is better to lift loop into `trial_position` and `compute_particle_weight`?
+            // that would save us all (but one) lookup in trial_position
+            // i.e write:
+            // fn trial_positions(system, pid, self.newpos, beta, rng) -> &Vec<Vector3D>
+            // where the resulting array would contain cb_steps elements
+            for step in 0..self.cb_steps {
+                // new weight
+                trialpos.push(trial_position(system, pid, &self.newpos, &beta, rng));
+                // energy between the trial particle and ALL other partiles (excluding the growing molecule)
+                // the function name is missleading, it only computes the BMF, i.e. exp(-beta U)
+                trial_weights.push(compute_particle_weight(system, &trialpos, pid));
+            };
+            let sum_of_weights = trial_weights.iter().sum();
+            trial_weights /= sum_of_weights;  // will not work, do this element wise (map)
+            self.new_weights.push(sum_of_weights);
+            self.newpos.push(select_position(&trialpos, &trial_weights, rng));
+
+            // compute weight for OLD configuration
+            // the zero'th weight is the old position
+            // Q: use one loop.
+            // Q: use existing configs instead of random sampling?
+            trial_weights.push(compute_particle_weight(system, system[pid].position, pid));
+            for step in 1..self.cb_steps {
+                // new weight
+                // do the same as above m.b. refactor into fn
+            };
+            self.old_weights.push(trial_weights.iter().sum())
+        };
+        true
     }
 
     fn cost(&self, system: &System, beta: f64, cache: &mut EnergyCache) -> f64 {
         let idxes = system.molecule(self.molid).iter().collect::<Vec<_>>();
-        let cost = cache.move_particles_cost(system, idxes, &self.newpos);
-        return cost*beta;
+        // update cache
+        let _ = cache.move_particles_cost(system, idxes, &self.newpos);
+        let new_weight = self.new_weights.product();
+        let old_weight = self.old_weights.product();
+        return beta * (new_weight / old_weight);
     }
 
     fn apply(&mut self, system: &mut System) {
@@ -118,7 +147,14 @@ impl MCMove for Rebuild {
     }
 
     fn update_amplitude(&mut self, scaling_factor: Option<f64>) {
-        // Nothing to do.
+        // We could check the scaling and increase the number of steps
+        // if the scaling is larger than one or decrease if its lower.
+        if let Some(s) = scaling_factor {
+            match s {
+              s < 1.0  =>,
+              _ =>,
+            }
+        }
     }
 }
 
